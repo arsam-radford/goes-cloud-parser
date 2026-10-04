@@ -1,0 +1,21 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'org.skyview'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://artifacts.unidata.ucar.edu/repository/unidata-all/' }
+}
+
+dependencies {
+    implementation 'edu.ucar:cdm-core:5.11.0'
+    runtimeOnly 'org.slf4j:slf4j-jdk14:2.0.19'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
