@@ -10,8 +10,10 @@ import ucar.nc2.dataset.NetcdfDatasets;
 import ucar.nc2.dataset.VariableDS;
 import ucar.unidata.geoloc.projection.sat.Geostationary;
 
-/** Decodes a downloaded GOES-19 ABI-L2-ACMC file */
+/** Decodes downloaded GOES-19 CONUS cloud masks and cloud-top height files. */
 public final class GoesCloudMaskParser {
+    private static final String MASK_PRODUCT = "ABI-L2-ACMC";
+    private static final String HEIGHT_PRODUCT = "ABI-L2-ACHAC";
     private static final int MIN_AXIS_LENGTH = 2;
     private static final int MAX_GRID_CELLS = 4_000_000;
     private static final double MAX_LONGITUDE_DEGREES = 180.0;
@@ -32,25 +34,67 @@ public final class GoesCloudMaskParser {
         }
 
         try (var file = NetcdfDatasets.openDataset(netcdfFile.toAbsolutePath().toString())) {
-            validateProduct(file);
+            validateProduct(file, MASK_PRODUCT);
             return readMask(file);
         } catch (IOException | RuntimeException exception) {
             throw new IOException("GOES file " + netcdfFile + ": " + exception.getMessage(), exception);
         }
     }
 
+    /**
+     * Reads cloud-top geopotential heights into memory and closes the file before returning.
+     * @param netcdfFile local GOES-19 CONUS cloud-top height file
+     * @return its own height grid and scan timestamps
+     * @throws IllegalArgumentException if the path is null
+     * @throws IOException if reading fails or required data/metadata are malformed
+     */
+    public CloudTopHeight parseCloudTopHeight(Path netcdfFile) throws IOException {
+        if (netcdfFile == null) {
+            throw new IllegalArgumentException("A local NetCDF file path is required.");
+        }
+
+        try (var file = NetcdfDatasets.openDataset(netcdfFile.toAbsolutePath().toString())) {
+            validateProduct(file, HEIGHT_PRODUCT);
+            return readCloudTopHeight(file);
+        } catch (IOException | RuntimeException exception) {
+            throw new IOException("GOES height file " + netcdfFile + ": " + exception.getMessage(), exception);
+        }
+    }
+
     /** Reads only the fields needed for cloud lookup, avoiding extra ABI variables */
     private CloudMask readMask(NetcdfFile file) throws IOException {
+        CloudGrid grid = readGrid(file);
+        VariableDS acm = readGridVariable(file, "ACM", grid.getRowCount(), grid.getColumnCount());
+        VariableDS probability = readGridVariable(file, "Cloud_Probabilities", grid.getRowCount(), grid.getColumnCount());
+        VariableDS quality = readGridVariable(file, "DQF", grid.getRowCount(), grid.getColumnCount());
+
+        return new CloudMask(grid, acm.read(), probability.read(), quality.read());
+    }
+
+    /** Uses NetCDF enhancement for height scaling, fill values, and valid-range checks. */
+    private CloudTopHeight readCloudTopHeight(NetcdfFile file) throws IOException {
+        CloudGrid grid = readGrid(file);
+        VariableDS height = readGridVariable(file, "HT", grid.getRowCount(), grid.getColumnCount());
+        VariableDS quality = readGridVariable(file, "DQF", grid.getRowCount(), grid.getColumnCount());
+
+        if (!height.findAttributeString("units", "").equals("m")
+                || !height.findAttributeString("standard_name", "").equals("geopotential_height_at_cloud_top")) {
+            throw new IOException("HT must be cloud-top geopotential height in metres.");
+        }
+
+        height.setInvalidDataIsMissing(true);
+
+        return new CloudTopHeight(grid, height.read(), quality.read());
+    }
+
+    /** Each product supplies its own axes, navigation, and observation times. */
+    private CloudGrid readGrid(NetcdfFile file) throws IOException {
         double[] x = readAxis(file, "x");
         double[] y = readAxis(file, "y");
 
         if ((long) x.length * y.length > MAX_GRID_CELLS) {
             throw new IOException("CONUS grid exceeds " + MAX_GRID_CELLS + " pixels.");
         }
-
-        VariableDS acm = readGridVariable(file, "ACM", y.length, x.length);
-        VariableDS probability = readGridVariable(file, "Cloud_Probabilities", y.length, x.length);
-        VariableDS quality = readGridVariable(file, "DQF", y.length, x.length);
 
         Instant start = readTime(file, "time_coverage_start");
         Instant end = readTime(file, "time_coverage_end");
@@ -59,14 +103,14 @@ public final class GoesCloudMaskParser {
             throw new IOException("time_coverage_end precedes time_coverage_start.");
         }
 
-        return new CloudMask(start, end, x, y, acm.read(), probability.read(), quality.read(), readProjection(file));
+        return new CloudGrid(start, end, x, y, readProjection(file));
     }
 
-    /** prevents treating another satellite product as an ACM CONUS mask. */
-    private void validateProduct(NetcdfFile file) throws IOException {
+    /** Prevents reading the wrong satellite, region, or product as a cloud dataset. */
+    private void validateProduct(NetcdfFile file, String product) throws IOException {
         if (!readText(file, "platform_ID").equals("G19") || !readText(file, "scene_id").equals("CONUS")
-                || !readText(file, "dataset_name").startsWith("OR_ABI-L2-ACMC-")) {
-            throw new IOException("Expected a GOES-19 ABI-L2-ACMC CONUS product.");
+                || !readText(file, "dataset_name").startsWith("OR_" + product + "-")) {
+            throw new IOException("Expected a GOES-19 " + product + " CONUS product.");
         }
     }
 
